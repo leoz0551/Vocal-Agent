@@ -1,25 +1,34 @@
+import os
+from dotenv import load_dotenv
 from textwrap import dedent
 from agno.agent import Agent
-from agno.models.ollama import Ollama
+from agno.models.openai import OpenAIChat
 from agno.tools.googlesearch import GoogleSearchTools
 from agno.tools.wikipedia import WikipediaTools
 from agno.tools.arxiv import ArxivTools
 from agno.run.response import RunResponse
 
+load_dotenv()
+
 # Define the Knowledge Agent
 knowledge_agent_ai = Agent(
-    model=Ollama(id="llama3.1:8b"),
+    model=OpenAIChat(
+        id=os.getenv("MODEL_ID", "openai/gpt-4o-mini"),
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url=os.getenv("MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    ),
     tools=[
         GoogleSearchTools(),  # For performing web searches
         WikipediaTools(),  # For searching Wikipedia content
         ArxivTools(),  # For searching Arxiv publications
     ],
     instructions=dedent("""\
-        You are a knowledge assistant that answers questions concisely. Use the available tools:
+        You are a knowledge assistant that answers questions concisely. Use the available tools ONLY when necessary:
         - Google Search for general queries and information
         - Wikipedia for facts and history
         - Arxiv for research and papers
-        - if it is normal question, answer it directly without using tools
+        - IMPORTANT: If the user just says a greeting (like 'Hello') or asks a normal conversational question, answer directly WITHOUT using any tools.
+        - CRITICAL: When using tools, if a parameter expects a list, you MUST pass a valid JSON list (e.g. []), NOT a string (e.g. '[]').
         Do not use special characters or emojis in your responses.
         Note: Provide clear conversational response in 1-2 sentences and The response should be natural and engaging, and the length depends on what you have to say"""),
     add_datetime_to_instructions=True,

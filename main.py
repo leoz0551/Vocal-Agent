@@ -30,6 +30,13 @@ def setup_signal_handler():
 def initialize_models():
     global fallback, g2p, kokoro, stt_recorder
     
+    # 自动信任 silero-vad 仓库，解决 "Untrusted repository" 报错
+    import torch
+    try:
+        torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True)
+    except Exception:
+        pass
+
     # Initialize TTS and STT Models
     fallback = espeak.EspeakFallback(british=False)
     g2p = en.G2P(trf=False, british=False, fallback=fallback)
@@ -37,13 +44,15 @@ def initialize_models():
     print("🎙️ TTS and STT models initialized.")
     
     stt_recorder = AudioToTextRecorder(
-        model="large-v1",
+        model="base.en",
         language="en",
         use_microphone=True,
         on_recording_start=lambda: print(" - 🎤 Recording started"),
         on_recording_stop=lambda: print(" - 🛑 Recording stopped"),
-        device="cuda",
-        realtime_model_type="large-v1"
+        device="cpu",
+        realtime_model_type="base.en",
+        compute_type="int8",
+        beam_size=1
     )
 
 def process_audio_stream():
@@ -75,13 +84,46 @@ def create_and_play_response(prompt):
         is_playing.set()  # Pause STT to prevent feedback loop
         try:
             agent_response = knowledge_agent_client(prompt)
+            if not agent_response:
+                print("⚠️ No valid response from agent, skipping TTS.")
+                return
             print(f"🤖 Response: {agent_response}")
-            phonemes, _ = g2p(agent_response)
-            samples, sample_rate = kokoro.create(phonemes, "af_heart", is_phonemes=True)
-            audio_data = samples.astype(np.float32)
-            if len(audio_data) > 0:
-                sd.play(audio_data.reshape(-1, 1), sample_rate)
+            
+            # 流式处理：分句生成音频并异步播放
+            import re
+            import queue
+            import threading
+            
+            audio_queue = queue.Queue()
+            
+            def generate_audio():
+                # 简单按标点分句
+                sentences = re.split(r'(?<=[.!?])\s+', agent_response.strip())
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    try:
+                        phonemes, _ = g2p(sentence)
+                        if phonemes:
+                            samples, sample_rate = kokoro.create(phonemes, "af_heart", is_phonemes=True)
+                            if len(samples) > 0:
+                                audio_queue.put((samples.astype(np.float32), sample_rate))
+                    except Exception as e:
+                        print(f"❌ Error synthesizing sentence: {e}")
+                audio_queue.put(None) # 结束标志
+                
+            # 开启线程在后台生成音频
+            threading.Thread(target=generate_audio, daemon=True).start()
+            
+            # 主线程负责按顺序播放，不等待全段生成
+            while True:
+                item = audio_queue.get()
+                if item is None:
+                    break
+                audio_data, sr = item
+                sd.play(audio_data.reshape(-1, 1), sr)
                 sd.wait()
+                
         except Exception as e:
             print(f"❌ Error in TTS: {str(e)}")
         finally:

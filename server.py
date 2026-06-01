@@ -97,6 +97,14 @@ class ErrorResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Server Configuration (from .env)
+# ---------------------------------------------------------------------------
+
+SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+
+
+# ---------------------------------------------------------------------------
 # FastAPI Application
 # ---------------------------------------------------------------------------
 
@@ -107,6 +115,7 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc",
 )
+
 
 # ---------------------------------------------------------------------------
 # Global Model References
@@ -189,6 +198,21 @@ async def health_check():
         models_loaded=models_loaded,
         timestamp=datetime.now().isoformat(),
     )
+
+
+@app.get("/api/v1/config", tags=["System"])
+async def get_config():
+    """
+    Return server configuration for frontend clients.
+
+    Frontend can call this on startup to discover the correct
+    API base URL and WebSocket URL dynamically.
+    """
+    return {
+        "api_base_url": os.getenv("API_BASE_URL", ""),
+        "ws_base_url": os.getenv("WS_BASE_URL", ""),
+        "version": "1.0.0",
+    }
 
 
 @app.post("/api/v1/stt", response_model=STTResponse, tags=["Speech"])
@@ -353,3 +377,13 @@ async def websocket_voice(ws: WebSocket):
 # ---------------------------------------------------------------------------
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Entry point: python server.py
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting server on {SERVER_HOST}:{SERVER_PORT}")
+    uvicorn.run("server:app", host=SERVER_HOST, port=SERVER_PORT, reload=True)

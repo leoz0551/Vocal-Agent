@@ -42,6 +42,13 @@
 
     <script>
     // =====================================================================
+    // Configurable Backend URLs
+    // =====================================================================
+    // Defaults to current origin; overridden by /api/v1/config response.
+    let API_BASE = '';   // e.g. 'http://192.168.1.100:8001'  (empty = same origin)
+    let WS_BASE  = '';   // e.g. 'ws://192.168.1.100:8001'    (empty = auto-detect)
+
+    // =====================================================================
     // State
     // =====================================================================
     let ws = null;
@@ -60,11 +67,34 @@
     const statusText  = document.getElementById('status-text');
 
     // =====================================================================
+    // Load Config then Connect
+    // =====================================================================
+    async function init() {
+        try {
+            const res = await fetch('/api/v1/config');
+            if (res.ok) {
+                const cfg = await res.json();
+                if (cfg.api_base_url) API_BASE = cfg.api_base_url.replace(/\/+$/, '');
+                if (cfg.ws_base_url)  WS_BASE  = cfg.ws_base_url.replace(/\/+$/, '');
+            }
+        } catch (e) {
+            console.warn('Could not fetch config, using defaults:', e);
+        }
+        connectWebSocket();
+    }
+
+    // =====================================================================
     // WebSocket
     // =====================================================================
     function connectWebSocket() {
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${location.host}/ws/v1/voice`);
+        let wsUrl;
+        if (WS_BASE) {
+            wsUrl = `${WS_BASE}/ws/v1/voice`;
+        } else {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            wsUrl = `${protocol}//${location.host}/ws/v1/voice`;
+        }
+        ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
             statusDot.className = 'online';
@@ -84,7 +114,6 @@
 
         ws.onmessage = async (event) => {
             if (event.data instanceof Blob) {
-                // Binary = audio chunk from TTS
                 audioQueue.push(event.data);
                 playNextAudio();
             } else {
@@ -97,7 +126,6 @@
                         appendMessage('assistant', msg.text);
                         break;
                     case 'audio_end':
-                        // All audio chunks received
                         break;
                     case 'error':
                         appendMessage('system', `⚠️ ${msg.message}`);
@@ -167,8 +195,7 @@
         appendMessage('user', text);
 
         try {
-            // Chat API
-            const res = await fetch('/api/v1/chat', {
+            const res = await fetch(`${API_BASE}/api/v1/chat`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ message: text }),
@@ -178,8 +205,7 @@
 
             appendMessage('assistant', data.response);
 
-            // TTS
-            const ttsRes = await fetch('/api/v1/tts', {
+            const ttsRes = await fetch(`${API_BASE}/api/v1/tts`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text: data.response }),
@@ -244,7 +270,7 @@
     // =====================================================================
     // Init
     // =====================================================================
-    connectWebSocket();
+    init();
     </script>
 </body>
 </html>

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vocal Agent</title>
+    <meta name="description" content="Real-time voice AI assistant powered by Whisper STT, OpenRouter LLM, and Kokoro TTS.">
+    <link rel="stylesheet" href="/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header id="header">
+            <h1>🎙️ Vocal Agent</h1>
+            <div id="status-badge">
+                <span id="status-dot"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </header>
+
+        <!-- Chat Area -->
+        <main id="chat-area">
+            <div id="messages"></div>
+        </main>
+
+        <!-- Input Area -->
+        <footer id="input-area">
+            <div id="input-row">
+                <input type="text" id="text-input" placeholder="Type a message..." autocomplete="off" />
+                <button id="send-btn" title="Send text">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg>
+                </button>
+                <button id="mic-btn" title="Hold to record">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                </button>
+            </div>
+            <p id="mic-hint">Hold mic button to record</p>
+        </footer>
+    </div>
+
+    <script>
+    // =====================================================================
+    // State
+    // =====================================================================
+    let ws = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    let audioQueue = [];
+    let isPlayingAudio = false;
+
+    const messagesEl  = document.getElementById('messages');
+    const textInput   = document.getElementById('text-input');
+    const sendBtn     = document.getElementById('send-btn');
+    const micBtn      = document.getElementById('mic-btn');
+    const micHint     = document.getElementById('mic-hint');
+    const statusDot   = document.getElementById('status-dot');
+    const statusText  = document.getElementById('status-text');
+
+    // =====================================================================
+    // WebSocket
+    // =====================================================================
+    function connectWebSocket() {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}/ws/v1/voice`);
+
+        ws.onopen = () => {
+            statusDot.className = 'online';
+            statusText.textContent = 'Connected';
+        };
+
+        ws.onclose = () => {
+            statusDot.className = 'offline';
+            statusText.textContent = 'Disconnected';
+            setTimeout(connectWebSocket, 3000);
+        };
+
+        ws.onerror = () => {
+            statusDot.className = 'offline';
+            statusText.textContent = 'Error';
+        };
+
+        ws.onmessage = async (event) => {
+            if (event.data instanceof Blob) {
+                // Binary = audio chunk from TTS
+                audioQueue.push(event.data);
+                playNextAudio();
+            } else {
+                const msg = JSON.parse(event.data);
+                switch (msg.type) {
+                    case 'transcription':
+                        appendMessage('user', msg.text);
+                        break;
+                    case 'response':
+                        appendMessage('assistant', msg.text);
+                        break;
+                    case 'audio_end':
+                        // All audio chunks received
+                        break;
+                    case 'error':
+                        appendMessage('system', `⚠️ ${msg.message}`);
+                        break;
+                }
+            }
+        };
+    }
+
+    // =====================================================================
+    // Audio Playback Queue
+    // =====================================================================
+    async function playNextAudio() {
+        if (isPlayingAudio || audioQueue.length === 0) return;
+        isPlayingAudio = true;
+
+        const blob = audioQueue.shift();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+
+        audio.onended = () => {
+            URL.revokeObjectURL(url);
+            isPlayingAudio = false;
+            playNextAudio();
+        };
+
+        audio.onerror = () => {
+            URL.revokeObjectURL(url);
+            isPlayingAudio = false;
+            playNextAudio();
+        };
+
+        try { await audio.play(); } catch(e) { isPlayingAudio = false; playNextAudio(); }
+    }
+
+    // =====================================================================
+    // Messages
+    // =====================================================================
+    function appendMessage(role, text) {
+        const div = document.createElement('div');
+        div.className = `msg msg-${role}`;
+
+        const label = role === 'user' ? '🧑 You' : role === 'assistant' ? '🤖 Agent' : 'ℹ️ System';
+        div.innerHTML = `<span class="msg-label">${label}</span><p>${escapeHtml(text)}</p>`;
+
+        messagesEl.appendChild(div);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+
+    // =====================================================================
+    // Text Input
+    // =====================================================================
+    sendBtn.addEventListener('click', sendText);
+    textInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendText(); });
+
+    async function sendText() {
+        const text = textInput.value.trim();
+        if (!text) return;
+        textInput.value = '';
+
+        appendMessage('user', text);
+
+        try {
+            // Chat API
+            const res = await fetch('/api/v1/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: text }),
+            });
+            const data = await res.json();
+            if (!res.ok) { appendMessage('system', `⚠️ ${data.detail}`); return; }
+
+            appendMessage('assistant', data.response);
+
+            // TTS
+            const ttsRes = await fetch('/api/v1/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: data.response }),
+            });
+            if (ttsRes.ok) {
+                const blob = await ttsRes.blob();
+                audioQueue.push(blob);
+                playNextAudio();
+            }
+        } catch (e) {
+            appendMessage('system', `⚠️ Request failed: ${e.message}`);
+        }
+    }
+
+    // =====================================================================
+    // Microphone (hold to record)
+    // =====================================================================
+    micBtn.addEventListener('mousedown', startRecording);
+    micBtn.addEventListener('mouseup', stopRecording);
+    micBtn.addEventListener('mouseleave', stopRecording);
+    micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+    micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+
+    async function startRecording() {
+        if (isRecording) return;
+        isRecording = true;
+        audioChunks = [];
+        micBtn.classList.add('recording');
+        micHint.textContent = '🔴 Recording...';
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+            mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+            mediaRecorder.onstop = () => {
+                stream.getTracks().forEach(t => t.stop());
+                const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(blob);
+                    micHint.textContent = '⏳ Processing...';
+                }
+            };
+            mediaRecorder.start();
+        } catch (e) {
+            appendMessage('system', `⚠️ Microphone access denied: ${e.message}`);
+            isRecording = false;
+            micBtn.classList.remove('recording');
+        }
+    }
+
+    function stopRecording() {
+        if (!isRecording || !mediaRecorder) return;
+        isRecording = false;
+        micBtn.classList.remove('recording');
+        micHint.textContent = 'Hold mic button to record';
+
+        if (mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+        }
+    }
+
+    // =====================================================================
+    // Init
+    // =====================================================================
+    connectWebSocket();
+    </script>
+</body>
+</html>

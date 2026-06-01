@@ -18,3 +18,10 @@ espeakng-loader>=0.2.4
 colorlog>=6.9.0
 sounddevice>=0.5.1
 soundfile>=0.13.0
+
+# Web service
+fastapi
+uvicorn[standard]
+python-multipart
+faster-whisper
+python-dotenv

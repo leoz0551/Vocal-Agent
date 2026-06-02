@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from agent_client import knowledge_agent_client
@@ -116,6 +117,17 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
+# ---------------------------------------------------------------------------
+# CORS Configuration
+# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 建议在生产环境中将 "*" 替换为实际的前端域名白名单
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ---------------------------------------------------------------------------
 # Global Model References
@@ -162,10 +174,35 @@ def _ensure_models():
 
 def _synthesize_wav(text: str, voice: str = "af_heart") -> bytes:
     """Convert a text string to WAV audio bytes via Kokoro TTS."""
-    phonemes, _ = g2p(text)
-    samples, sample_rate = kokoro_model.create(phonemes, voice, is_phonemes=True)
+    # Split text into sentences to prevent exceeding the 510 phoneme limit
+    chunks = re.split(r'(?<=[.!?。！？])\s+|\n+', text.strip())
+    
+    all_samples = []
+    sample_rate = 24000  # Default sample rate
+    
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+            
+        phonemes, _ = g2p(chunk)
+        if not phonemes:
+            continue
+            
+        try:
+            samples, sr = kokoro_model.create(phonemes, voice, is_phonemes=True)
+            all_samples.append(samples)
+            sample_rate = sr
+        except Exception as e:
+            logger.warning(f"Skipping TTS for chunk due to error: {e}")
+            continue
+
+    if not all_samples:
+        raise ValueError("Could not synthesize any audio from the provided text.")
+
+    final_samples = np.concatenate(all_samples)
     buf = io.BytesIO()
-    sf.write(buf, samples.astype(np.float32), sample_rate, format="WAV")
+    sf.write(buf, final_samples.astype(np.float32), sample_rate, format="WAV")
     buf.seek(0)
     return buf.read()
 

@@ -217,7 +217,8 @@ def _synthesize_wav(text: str, voice: Optional[str] = None) -> bytes:
             continue
 
     if not all_samples:
-        raise ValueError("Could not synthesize any audio from the provided text.")
+        logger.warning(f"⚠️ Could not synthesize any audio for text: {text!r} (Voice: {voice})")
+        return b""
 
     final_samples = np.concatenate(all_samples)
     buf = io.BytesIO()
@@ -396,13 +397,17 @@ async def websocket_tts(ws: WebSocket):
                 if asyncio.current_task().cancelled():
                     break
                     
-                wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice_override)
-                
-                # Check again after yielding to thread
-                if asyncio.current_task().cancelled():
-                    break
+                try:
+                    wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice_override)
                     
-                await ws.send_bytes(wav_bytes)
+                    # Check again after yielding to thread
+                    if asyncio.current_task().cancelled():
+                        break
+                        
+                    if wav_bytes:
+                        await ws.send_bytes(wav_bytes)
+                except Exception as e:
+                    logger.error(f"⚠️ Error synthesizing chunk {chunk!r}: {e}")
                 
             # Signal end if completed naturally
             if not asyncio.current_task().cancelled():

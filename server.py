@@ -16,6 +16,7 @@ API Endpoints (v1):
 import os
 import io
 import re
+import time
 import asyncio
 import logging
 import tempfile
@@ -33,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from agent_client import knowledge_agent_client
 from kokoro_onnx import Kokoro
-from misaki import en, espeak
+from misaki import en, espeak, zh
 
 load_dotenv()
 
@@ -80,7 +81,7 @@ class STTResponse(BaseModel):
 class TTSRequest(BaseModel):
     """Text-to-Speech request payload."""
     text: str = Field(..., min_length=1, description="Text to synthesize")
-    voice: str = Field(default="af_heart", description="Voice profile name")
+    voice: Optional[str] = Field(default=None, description="Voice profile name")
 
 
 class ConversationResponse(BaseModel):
@@ -133,7 +134,8 @@ app.add_middleware(
 # Global Model References
 # ---------------------------------------------------------------------------
 
-g2p = None
+g2p_en = None
+g2p_zh = None
 kokoro_model = None
 whisper_model = None
 models_loaded = False
@@ -142,17 +144,18 @@ models_loaded = False
 @app.on_event("startup")
 async def load_models():
     """Load all ML models on server startup."""
-    global g2p, kokoro_model, whisper_model, models_loaded
+    global g2p_en, g2p_zh, kokoro_model, whisper_model, models_loaded
 
-    logger.info("Loading TTS models (Kokoro + G2P) ...")
+    logger.info("Loading TTS models (Kokoro + G2P en/zh) ...")
     fallback = espeak.EspeakFallback(british=False)
-    g2p = en.G2P(trf=False, british=False, fallback=fallback)
+    g2p_en = en.G2P(trf=False, british=False, fallback=fallback)
+    g2p_zh = zh.ZHG2P()
     kokoro_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
     logger.info("✅ TTS models loaded.")
 
-    logger.info("Loading STT model (faster-whisper base.en) ...")
+    logger.info("Loading STT model (faster-whisper base) ...")
     from faster_whisper import WhisperModel
-    whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+    whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
     logger.info("✅ STT model loaded.")
 
     models_loaded = True
@@ -172,29 +175,45 @@ def _ensure_models():
 # Helper: synthesize text → WAV bytes
 # ---------------------------------------------------------------------------
 
-def _synthesize_wav(text: str, voice: str = "af_heart") -> bytes:
+def _synthesize_wav(text: str, voice: Optional[str] = None) -> bytes:
     """Convert a text string to WAV audio bytes via Kokoro TTS."""
     # Split text into sentences to prevent exceeding the 510 phoneme limit
-    chunks = re.split(r'(?<=[.!?。！？])\s+|\n+', text.strip())
+    raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text.strip())
+    chunks = [c.strip() for c in raw_chunks if c.strip()]
+    total_chunks = len(chunks)
+    
+    logger.info(f"🎙️ Starting TTS synthesis. Text length: {len(text)}, split into {total_chunks} chunks.")
+    start_time = time.time()
     
     all_samples = []
     sample_rate = 24000  # Default sample rate
     
-    for chunk in chunks:
-        chunk = chunk.strip()
-        if not chunk:
-            continue
+    for i, chunk in enumerate(chunks, 1):
+        # Dynamically route Chinese and English
+        is_chinese = bool(re.search(r'[\u4e00-\u9fff]', chunk))
+        lang_tag = "ZH" if is_chinese else "EN"
+        
+        if is_chinese:
+            phonemes, _ = g2p_zh(chunk)
+            current_voice = voice if voice else "zf_xiaoxiao"
+        else:
+            phonemes, _ = g2p_en(chunk)
+            current_voice = voice if voice else "af_heart"
             
-        phonemes, _ = g2p(chunk)
         if not phonemes:
+            logger.warning(f"  [{i}/{total_chunks}] ⚠️ No phonemes generated for chunk.")
             continue
             
         try:
-            samples, sr = kokoro_model.create(phonemes, voice, is_phonemes=True)
+            chunk_start = time.time()
+            samples, sr = kokoro_model.create(phonemes, current_voice, is_phonemes=True)
             all_samples.append(samples)
             sample_rate = sr
+            elapsed = time.time() - chunk_start
+            preview = (chunk[:20] + "...") if len(chunk) > 20 else chunk
+            logger.info(f"  [{i}/{total_chunks}] ✅ [{lang_tag}] Synth in {elapsed:.2f}s | Voice: {current_voice} | Text: {preview}")
         except Exception as e:
-            logger.warning(f"Skipping TTS for chunk due to error: {e}")
+            logger.warning(f"  [{i}/{total_chunks}] ❌ Skipping TTS for chunk due to error: {e}")
             continue
 
     if not all_samples:
@@ -204,6 +223,11 @@ def _synthesize_wav(text: str, voice: str = "af_heart") -> bytes:
     buf = io.BytesIO()
     sf.write(buf, final_samples.astype(np.float32), sample_rate, format="WAV")
     buf.seek(0)
+    
+    total_elapsed = time.time() - start_time
+    total_audio_len = len(final_samples) / sample_rate
+    logger.info(f"🏁 TTS synthesis completed in {total_elapsed:.2f}s. Generated {total_audio_len:.2f}s of audio.")
+    
     return buf.read()
 
 
@@ -339,6 +363,61 @@ async def conversation(file: UploadFile = File(..., description="Audio file (WAV
 
 
 # ---------------------------------------------------------------------------
+# WebSocket v1 — Real-time TTS Stream
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/v1/tts")
+async def websocket_tts(ws: WebSocket):
+    """
+    Real-time text-to-speech over WebSocket.
+    
+    Protocol:
+        Client → Server: JSON {"text": "...", "voice": "..." (optional)}
+        Server → Client: binary (WAV audio chunk for each sentence)
+        Server → Client: JSON {"type": "tts_end"}
+    """
+    await ws.accept()
+    logger.info("🔌 WebSocket TTS client connected")
+    
+    try:
+        while True:
+            # 1. Receive JSON from client
+            try:
+                data = await ws.receive_json()
+            except Exception:
+                # Catch invalid JSON or disconnect during receive
+                break
+                
+            text = data.get("text", "")
+            voice = data.get("voice", None)
+            
+            if not text:
+                continue
+                
+            # 2. Split into sentences and synthesize
+            # Reusing the dynamic routing logic inside _synthesize_wav
+            raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text.strip())
+            chunks = [c.strip() for c in raw_chunks if c.strip()]
+            
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                try:
+                    wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice)
+                    await ws.send_bytes(wav_bytes)
+                except Exception as e:
+                    logger.error(f"TTS WebSocket error for chunk: {e}")
+                    
+            # 3. Signal end of this batch
+            await ws.send_json({"type": "tts_end"})
+            
+    except WebSocketDisconnect:
+        logger.info("🔌 WebSocket TTS client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket TTS error: {e}")
+
+
+# ---------------------------------------------------------------------------
 # WebSocket v1 — Real-time voice conversation
 # ---------------------------------------------------------------------------
 
@@ -390,8 +469,8 @@ async def websocket_voice(ws: WebSocket):
             await ws.send_json({"type": "response", "text": agent_response})
 
             # 4. TTS — stream sentence by sentence
-            sentences = re.split(r"(?<=[.!?])\s+", agent_response.strip())
-            for sentence in sentences:
+            raw_sentences = re.split(r'(?<=[.!?。！？])|\n+', agent_response.strip())
+            for sentence in raw_sentences:
                 sentence = sentence.strip()
                 if not sentence:
                     continue

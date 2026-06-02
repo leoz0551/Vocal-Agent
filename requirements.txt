@@ -7,7 +7,7 @@ wikipedia
 arxiv
 pypdf==5.4.0
 ollama
-misaki
+misaki[zh]
 num2words
 spacy
 scipy

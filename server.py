@@ -369,52 +369,82 @@ async def conversation(file: UploadFile = File(..., description="Audio file (WAV
 @app.websocket("/ws/v1/tts")
 async def websocket_tts(ws: WebSocket):
     """
-    Real-time text-to-speech over WebSocket.
+    Real-time text-to-speech over WebSocket with Abort support.
     
     Protocol:
         Client → Server: JSON {"text": "...", "voice": "..." (optional)}
+        Client → Server: JSON {"action": "abort"} (Cancels ongoing TTS)
         Server → Client: binary (WAV audio chunk for each sentence)
         Server → Client: JSON {"type": "tts_end"}
     """
     await ws.accept()
     logger.info("🔌 WebSocket TTS client connected")
     
+    current_task = None
+    
+    async def process_text_task(text_to_process: str, voice_override: Optional[str]):
+        """Background task to synthesize and stream chunks."""
+        raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text_to_process.strip())
+        chunks = [c.strip() for c in raw_chunks if c.strip()]
+        
+        try:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                
+                # Check for cancellation before expensive operations
+                if asyncio.current_task().cancelled():
+                    break
+                    
+                wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice_override)
+                
+                # Check again after yielding to thread
+                if asyncio.current_task().cancelled():
+                    break
+                    
+                await ws.send_bytes(wav_bytes)
+                
+            # Signal end if completed naturally
+            if not asyncio.current_task().cancelled():
+                await ws.send_json({"type": "tts_end"})
+        except asyncio.CancelledError:
+            logger.info("🛑 TTS background task was aborted cleanly.")
+        except Exception as e:
+            logger.error(f"TTS WebSocket background task error: {e}")
+
     try:
         while True:
-            # 1. Receive JSON from client
             try:
                 data = await ws.receive_json()
             except Exception:
                 # Catch invalid JSON or disconnect during receive
                 break
                 
+            action = data.get("action", "speak")
+            
+            if action == "abort":
+                if current_task and not current_task.done():
+                    current_task.cancel()
+                    logger.info("🛑 Received abort signal, cancelled ongoing TTS task.")
+                continue
+                
             text = data.get("text", "")
             voice = data.get("voice", None)
             
-            if not text:
-                continue
+            if text:
+                if current_task and not current_task.done():
+                    current_task.cancel()
+                    logger.info("⚠️ New text arrived, implicitly cancelled previous TTS task.")
                 
-            # 2. Split into sentences and synthesize
-            # Reusing the dynamic routing logic inside _synthesize_wav
-            raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text.strip())
-            chunks = [c.strip() for c in raw_chunks if c.strip()]
-            
-            for chunk in chunks:
-                if not chunk:
-                    continue
-                try:
-                    wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice)
-                    await ws.send_bytes(wav_bytes)
-                except Exception as e:
-                    logger.error(f"TTS WebSocket error for chunk: {e}")
-                    
-            # 3. Signal end of this batch
-            await ws.send_json({"type": "tts_end"})
-            
+                current_task = asyncio.create_task(process_text_task(text, voice))
+                
     except WebSocketDisconnect:
         logger.info("🔌 WebSocket TTS client disconnected")
     except Exception as e:
         logger.error(f"WebSocket TTS error: {e}")
+    finally:
+        if current_task and not current_task.done():
+            current_task.cancel()
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,15 @@
                 </select>
             </div>
             
+            <div class="form-group">
+                <label for="lang-select">Spoken Language (STT):</label>
+                <select id="lang-select">
+                    <option value="auto">Auto-Detect</option>
+                    <option value="zh">Chinese (zh)</option>
+                    <option value="en">English (en)</option>
+                </select>
+            </div>
+            
             <button id="btn-connect" class="btn-primary">Connect & Start Talking</button>
             <p style="text-align: center; margin-top: 1rem; color: #94a3b8; font-size: 0.9rem;">(Requires Microphone Permission)</p>
         </div>
@@ -170,12 +179,14 @@
             console.log("WebSocket connected. Sending init...");
             const prompt = document.getElementById('sys-prompt').value;
             const voice = document.getElementById('voice-select').value;
+            const lang = document.getElementById('lang-select').value;
             
             // Send Init Handshake
             ws.send(JSON.stringify({
                 action: "init",
                 system_prompt: prompt,
-                voice_id: voice
+                voice_id: voice,
+                language: lang
             }));
             
             // UI Transition

@@ -155,9 +155,9 @@ async def load_models():
     kokoro_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
     logger.info("✅ TTS models loaded.")
 
-    logger.info("Loading STT model (faster-whisper base) ...")
+    logger.info("Loading STT model (faster-whisper small) ...")
     from faster_whisper import WhisperModel
-    whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
     logger.info("✅ STT model loaded.")
 
     logger.info("Loading VAD model for V2...")
@@ -244,7 +244,7 @@ def _transcribe_audio(audio_bytes: bytes) -> tuple[str, float]:
         tmp_path = tmp.name
 
     try:
-        segments, info = whisper_model.transcribe(tmp_path, beam_size=1)
+        segments, info = whisper_model.transcribe(tmp_path, beam_size=5)
         text = " ".join(seg.text for seg in segments).strip()
         duration = getattr(info, "duration", 0.0)
     finally:
@@ -481,6 +481,12 @@ async def websocket_voice(ws: WebSocket):
             # 1. Receive audio from browser
             audio_data = await ws.receive_bytes()
             logger.info(f"📥 Received audio: {len(audio_data)} bytes")
+            
+            # Ignore extremely short audio chunks (e.g. quick click and release)
+            if len(audio_data) < 4096:
+                logger.warning("Audio data too small, ignoring.")
+                await ws.send_json({"type": "error", "message": "录音太短，请长按录音 (Audio too short, please hold to record)"})
+                continue
 
             # 2. STT
             try:

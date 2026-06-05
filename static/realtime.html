@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vocal Agent - V2 Realtime</title>
+    <meta name="description" content="V2 Real-time full duplex voice assistant.">
+    <link rel="stylesheet" href="/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        /* V2 Specific Styles */
+        body { background: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        #setup-area { background: #1e293b; padding: 2rem; border-radius: 12px; max-width: 600px; margin: 2rem auto; }
+        .form-group { margin-bottom: 1.5rem; }
+        .form-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
+        .form-group textarea, .form-group select { width: 100%; padding: 0.75rem; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: white; }
+        .btn-primary { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-weight: 600; width: 100%; transition: background 0.2s; }
+        .btn-primary:hover { background: #2563eb; }
+        .btn-danger { background: #ef4444; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600; transition: background 0.2s; }
+        .btn-danger:hover { background: #dc2626; }
+        
+        #app { display: flex; flex-direction: column; height: 100vh; max-width: 800px; margin: 0 auto; }
+        #chat-area { flex: 1; overflow-y: auto; padding: 1rem; }
+        .msg { margin-bottom: 1rem; padding: 1rem; border-radius: 8px; animation: fadeIn 0.3s ease; }
+        .msg-user { background: #1e293b; align-self: flex-end; border-left: 4px solid #3b82f6; }
+        .msg-assistant { background: #334155; align-self: flex-start; border-left: 4px solid #10b981; }
+        .msg-system { background: rgba(239, 68, 68, 0.1); border-left: 4px solid #ef4444; }
+        .msg-label { font-size: 0.8rem; font-weight: 600; margin-bottom: 0.5rem; display: block; color: #94a3b8; }
+        
+        #controls-area { padding: 1rem; background: #1e293b; border-top: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+        #mic-status { display: flex; align-items: center; gap: 0.5rem; font-weight: 500; }
+        .pulse { width: 12px; height: 12px; border-radius: 50%; background: #ef4444; animation: pulse 1.5s infinite; }
+        
+        @keyframes pulse { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .hidden { display: none !important; }
+        .typing::after { content: '...'; animation: blink 1s infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+
+    <!-- Setup Screen -->
+    <div id="setup-screen">
+        <div id="setup-area">
+            <h1 style="text-align: center; margin-bottom: 2rem;">🎙️ V2 Realtime Voice Agent</h1>
+            
+            <div class="form-group">
+                <label for="sys-prompt">System Prompt (Persona):</label>
+                <textarea id="sys-prompt" rows="5">You are a helpful and humorous voice assistant. Keep your answers concise, conversational, and completely free of markdown or emojis since your output will be read aloud by TTS.</textarea>
+            </div>
+            
+            <div class="form-group">
+                <label for="voice-select">TTS Voice:</label>
+                <select id="voice-select">
+                    <option value="af_heart">af_heart (Female, English)</option>
+                    <option value="zf_xiaoxiao">zf_xiaoxiao (Female, Chinese)</option>
+                    <option value="am_adam">am_adam (Male, English)</option>
+                </select>
+            </div>
+            
+            <button id="btn-connect" class="btn-primary">Connect & Start Talking</button>
+            <p style="text-align: center; margin-top: 1rem; color: #94a3b8; font-size: 0.9rem;">(Requires Microphone Permission)</p>
+        </div>
+    </div>
+
+    <!-- Active Call Screen -->
+    <div id="app" class="hidden">
+        <header style="padding: 1rem; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center;">
+            <h2 style="margin: 0; font-size: 1.2rem;">V2 Realtime Session</h2>
+            <div style="display: flex; gap: 1rem; align-items: center;">
+                <span id="agent-status" style="color: #94a3b8; font-size: 0.9rem;">Waiting...</span>
+                <button id="btn-disconnect" class="btn-danger">Disconnect</button>
+            </div>
+        </header>
+
+        <main id="chat-area">
+            <div id="messages"></div>
+        </main>
+
+        <footer id="controls-area">
+            <div id="mic-status">
+                <div class="pulse"></div>
+                <span>Microphone Active (Continuous)</span>
+            </div>
+            <button id="btn-interrupt" class="btn-danger">Stop AI (Abort)</button>
+        </footer>
+    </div>
+
+    <script>
+    // Config
+    let WS_BASE = '';
+    
+    // State
+    let ws = null;
+    let mediaRecorder = null;
+    let audioQueue = [];
+    let isPlayingAudio = false;
+    let currentAssistantMsgId = null; // To append streaming text
+    let activeAudioElements = [];
+
+    // DOM
+    const setupScreen = document.getElementById('setup-screen');
+    const appScreen = document.getElementById('app');
+    const btnConnect = document.getElementById('btn-connect');
+    const btnDisconnect = document.getElementById('btn-disconnect');
+    const btnInterrupt = document.getElementById('btn-interrupt');
+    const chatArea    = document.getElementById('chat-area');
+    const messagesEl  = document.getElementById('messages');
+    const agentStatus = document.getElementById('agent-status');
+
+    async function initConfig() {
+        try {
+            const res = await fetch('/api/v1/config');
+            if (res.ok) {
+                const cfg = await res.json();
+                if (cfg.ws_base_url) WS_BASE = cfg.ws_base_url.replace(/\/+$/, '');
+            }
+        } catch (e) {
+            console.warn('Config fetch failed, using relative URL');
+        }
+    }
+
+    btnConnect.addEventListener('click', async () => {
+        btnConnect.disabled = true;
+        btnConnect.textContent = 'Requesting Mic...';
+        
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            connectWebSocket(stream);
+        } catch (err) {
+            alert("Microphone access denied: " + err.message);
+            btnConnect.disabled = false;
+            btnConnect.textContent = 'Connect & Start Talking';
+        }
+    });
+
+    btnDisconnect.addEventListener('click', () => {
+        if(ws) ws.close();
+        if(scriptProcessor) {
+            scriptProcessor.disconnect();
+            microphoneSource.disconnect();
+        }
+        if(audioContext) audioContext.close();
+        
+        stopAllAudio();
+        
+        setupScreen.classList.remove('hidden');
+        appScreen.classList.add('hidden');
+        btnConnect.disabled = false;
+        btnConnect.textContent = 'Connect & Start Talking';
+        messagesEl.innerHTML = '';
+        currentAssistantMsgId = null;
+    });
+    
+    btnInterrupt.addEventListener('click', () => {
+        if(ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({action: "abort"}));
+        }
+    });
+
+    function connectWebSocket(audioStream) {
+        let wsUrl = WS_BASE ? `${WS_BASE}/ws/v2/voice` : `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/v2/voice`;
+        
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            console.log("WebSocket connected. Sending init...");
+            const prompt = document.getElementById('sys-prompt').value;
+            const voice = document.getElementById('voice-select').value;
+            
+            // Send Init Handshake
+            ws.send(JSON.stringify({
+                action: "init",
+                system_prompt: prompt,
+                voice_id: voice
+            }));
+            
+            // UI Transition
+            setupScreen.classList.add('hidden');
+            appScreen.classList.remove('hidden');
+            agentStatus.textContent = 'Initializing...';
+            
+            // Start recording chunks
+            startRecordingPCM(audioStream);
+        };
+
+        ws.onmessage = async (event) => {
+            if (event.data instanceof Blob) {
+                // Received TTS Audio Chunk
+                audioQueue.push(event.data);
+                playNextAudio();
+            } else {
+                const msg = JSON.parse(event.data);
+                handleServerMessage(msg);
+            }
+        };
+        
+        ws.onclose = () => {
+            agentStatus.textContent = 'Disconnected';
+            btnDisconnect.click();
+        };
+    }
+    
+    let audioContext;
+    let microphoneSource;
+    let scriptProcessor;
+
+    function startRecordingPCM(stream) {
+        // Create an AudioContext with a fixed 16kHz sample rate
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        microphoneSource = audioContext.createMediaStreamSource(stream);
+        
+        // Use ScriptProcessor (deprecated but works reliably everywhere without separate files)
+        scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        
+        scriptProcessor.onaudioprocess = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const float32Array = e.inputBuffer.getChannelData(0);
+                
+                // Convert Float32 to Int16
+                const int16Array = new Int16Array(float32Array.length);
+                for (let i = 0; i < float32Array.length; i++) {
+                    let s = Math.max(-1, Math.min(1, float32Array[i]));
+                    int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+                
+                // Send raw binary Int16 buffer
+                ws.send(int16Array.buffer);
+            }
+        };
+
+        // Connect nodes
+        microphoneSource.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination);
+    }
+
+    function handleServerMessage(msg) {
+        console.log("Server Msg:", msg.type);
+        
+        if (msg.type === 'init_success') {
+            agentStatus.textContent = 'Listening...';
+        }
+        else if (msg.type === 'transcription') {
+            appendMessage('user', msg.text);
+            currentAssistantMsgId = null; // reset for next response
+        }
+        else if (msg.type === 'thinking') {
+            agentStatus.textContent = msg.message;
+        }
+        else if (msg.type === 'response_chunk') {
+            agentStatus.textContent = 'Speaking...';
+            appendOrUpdateAssistantMessage(msg.text);
+        }
+        else if (msg.type === 'audio_end') {
+            agentStatus.textContent = 'Listening...';
+        }
+        else if (msg.type === 'clear_audio') {
+            // INTERRUPT: Stop playing immediately
+            console.log("Interrupt received! Stopping audio...");
+            stopAllAudio();
+            agentStatus.textContent = 'Listening (Interrupted)';
+            currentAssistantMsgId = null;
+        }
+        else if (msg.type === 'error') {
+            appendMessage('system', `Error: ${msg.message}`);
+        }
+    }
+
+    function generateId() { return 'msg-' + Math.random().toString(36).substr(2, 9); }
+
+    function appendMessage(role, text) {
+        const div = document.createElement('div');
+        div.className = `msg msg-${role}`;
+        
+        const label = role === 'user' ? '🧑 You' : role === 'assistant' ? '🤖 Agent' : 'ℹ️ System';
+        const p = document.createElement('p');
+        p.textContent = text;
+        
+        div.innerHTML = `<span class="msg-label">${label}</span>`;
+        div.appendChild(p);
+        
+        messagesEl.appendChild(div);
+        chatArea.scrollTop = chatArea.scrollHeight;
+    }
+    
+    function appendOrUpdateAssistantMessage(chunkText) {
+        if (!currentAssistantMsgId) {
+            currentAssistantMsgId = generateId();
+            const div = document.createElement('div');
+            div.className = `msg msg-assistant`;
+            div.id = currentAssistantMsgId;
+            div.innerHTML = `<span class="msg-label">🤖 Agent</span><p class="content"></p>`;
+            messagesEl.appendChild(div);
+        }
+        
+        const msgDiv = document.getElementById(currentAssistantMsgId);
+        if (msgDiv) {
+            const p = msgDiv.querySelector('.content');
+            p.textContent += chunkText;
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+    }
+
+    // --- Audio Playback Management ---
+    
+    async function playNextAudio() {
+        if (isPlayingAudio || audioQueue.length === 0) return;
+        isPlayingAudio = true;
+
+        const blob = audioQueue.shift();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        activeAudioElements.push(audio);
+
+        audio.onended = () => cleanupAudio(audio, url);
+        audio.onerror = () => cleanupAudio(audio, url);
+
+        try { 
+            await audio.play(); 
+        } catch(e) { 
+            cleanupAudio(audio, url); 
+        }
+    }
+    
+    function cleanupAudio(audio, url) {
+        URL.revokeObjectURL(url);
+        activeAudioElements = activeAudioElements.filter(a => a !== audio);
+        isPlayingAudio = false;
+        playNextAudio(); // play next in queue
+    }
+    
+    function stopAllAudio() {
+        // Pause and clear all currently playing elements
+        activeAudioElements.forEach(audio => {
+            audio.pause();
+            audio.src = "";
+        });
+        activeAudioElements = [];
+        
+        // Clear queue
+        audioQueue = [];
+        isPlayingAudio = false;
+    }
+
+    // Init config on load
+    initConfig();
+    </script>
+</body>
+</html>

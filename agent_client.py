@@ -37,8 +37,34 @@ knowledge_agent_ai = Agent(
     stream=False,
 )
 
+def create_streaming_agent(system_prompt: str) -> Agent:
+    """Factory method for creating a per-session agent with custom instructions."""
+    return Agent(
+        model=OpenAIChat(
+            id=os.getenv("MODEL_ID", "openai/gpt-4o-mini"),
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            base_url=os.getenv("MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        ),
+        tools=[],  # V2 Realtime voice agent defaults to no tools for fastest response
+        instructions=system_prompt,
+        add_datetime_to_instructions=True,
+        show_tool_calls=False,
+        markdown=True,
+        stream=True, # Enable streaming for v2
+    )
 
-
+def knowledge_agent_client_stream(agent: Agent, prompt: str):
+    """Yields streaming chunks of text from the agent."""
+    try:
+        response_stream = agent.run(message=prompt, stream=True)
+        for chunk in response_stream:
+            if isinstance(chunk, RunResponse) and chunk.content:
+                yield chunk.content
+            elif isinstance(chunk, str):
+                yield chunk
+    except Exception as e:
+        print(f"Error while querying knowledge_agent_stream: {str(e)}")
+        yield f"Error: {str(e)}"
 def knowledge_agent_client(prompt: str):
     try:
         response = knowledge_agent_ai.run(message=prompt, stream=False)

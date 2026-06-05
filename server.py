@@ -35,6 +35,8 @@ from pydantic import BaseModel, Field
 from agent_client import knowledge_agent_client
 from kokoro_onnx import Kokoro
 from misaki import en, espeak, zh
+from v2_realtime import RealtimeVoiceSession, get_vad_model
+
 
 load_dotenv()
 
@@ -157,6 +159,9 @@ async def load_models():
     from faster_whisper import WhisperModel
     whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
     logger.info("✅ STT model loaded.")
+
+    logger.info("Loading VAD model for V2...")
+    get_vad_model()
 
     models_loaded = True
     logger.info("🚀 All models ready — server is accepting requests.")
@@ -522,9 +527,27 @@ async def websocket_voice(ws: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
 
+# ---------------------------------------------------------------------------
+# WebSocket v2 — Real-time continuous voice conversation (Full Duplex)
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/v2/voice")
+async def websocket_v2_voice(ws: WebSocket):
+    """
+    Real-time continuous full-duplex voice conversation over WebSocket.
+    """
+    await ws.accept()
+    session = RealtimeVoiceSession(
+        ws=ws,
+        synthesize_fn=_synthesize_wav,
+        whisper_model=whisper_model
+    )
+    await session.start()
+
 
 # ---------------------------------------------------------------------------
 # Static files (frontend) — must be mounted LAST
+
 # ---------------------------------------------------------------------------
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

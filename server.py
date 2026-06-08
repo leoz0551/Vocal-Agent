@@ -182,9 +182,10 @@ def _ensure_models():
 
 def _synthesize_wav(text: str, voice: Optional[str] = None) -> bytes:
     """Convert a text string to WAV audio bytes via Kokoro TTS."""
-    # Split text into sentences to prevent exceeding the 510 phoneme limit
-    raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text.strip())
-    chunks = [c.strip() for c in raw_chunks if c.strip()]
+    # Split text into sentences/clauses to prevent exceeding phoneme limits and reduce latency
+    parts = re.split(r'([.!?。！？,，、;:：；\n…]+)', text.strip())
+    chunks = ["".join(parts[i:i+2]).strip() for i in range(0, len(parts), 2)]
+    chunks = [c for c in chunks if c]
     total_chunks = len(chunks)
     
     logger.info(f"🎙️ Starting TTS synthesis. Text length: {len(text)}, split into {total_chunks} chunks.")
@@ -390,8 +391,9 @@ async def websocket_tts(ws: WebSocket):
     
     async def process_text_task(text_to_process: str, voice_override: Optional[str]):
         """Background task to synthesize and stream chunks."""
-        raw_chunks = re.split(r'(?<=[.!?。！？])|\n+', text_to_process.strip())
-        chunks = [c.strip() for c in raw_chunks if c.strip()]
+        parts = re.split(r'([.!?。！？,，、;:：；\n…]+)', text_to_process.strip())
+        chunks = ["".join(parts[i:i+2]).strip() for i in range(0, len(parts), 2)]
+        chunks = [c for c in chunks if c]
         
         try:
             for chunk in chunks:
@@ -514,10 +516,10 @@ async def websocket_voice(ws: WebSocket):
 
             await ws.send_json({"type": "response", "text": agent_response})
 
-            # 4. TTS — stream sentence by sentence
-            raw_sentences = re.split(r'(?<=[.!?。！？])|\n+', agent_response.strip())
-            for sentence in raw_sentences:
-                sentence = sentence.strip()
+            # 4. TTS — stream sentence by sentence (now clause by clause)
+            parts = re.split(r'([.!?。！？,，、;:：；\n…]+)', agent_response.strip())
+            chunks = ["".join(parts[i:i+2]).strip() for i in range(0, len(parts), 2)]
+            for sentence in chunks:
                 if not sentence:
                     continue
                 try:

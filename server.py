@@ -157,7 +157,9 @@ async def load_models():
 
     logger.info("Loading STT model (faster-whisper small) ...")
     from faster_whisper import WhisperModel
-    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+    import os
+    whisper_model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "whisper")
+    whisper_model = WhisperModel("small", device="cpu", compute_type="int8", download_root=whisper_model_dir)
     logger.info("✅ STT model loaded.")
 
     logger.info("Loading VAD model for V2...")

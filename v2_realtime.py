@@ -23,6 +23,9 @@ def get_vad_model():
     if _vad_model is None:
         logger.info("Loading Silero VAD model for V2...")
         try:
+            import os
+            torch_hub_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "torch_hub")
+            torch.hub.set_dir(torch_hub_dir)
             _vad_model, _vad_utils = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", trust_repo=True)
             logger.info("✅ Silero VAD model loaded.")
         except Exception as e:

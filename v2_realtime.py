@@ -274,10 +274,12 @@ class RealtimeVoiceSession:
             # 2. LLM Streaming
             self.cancel_event = threading.Event()
             full_response = ""
-            current_sentence = ""
             
             sentence_queue = asyncio.Queue()
             tts_task = asyncio.create_task(self._tts_worker(sentence_queue, self.cancel_event))
+            
+            from sentence_splitter import SentenceSplitter
+            splitter = SentenceSplitter(first_min=4, merge_min=16)
             
             llm_stream = knowledge_agent_client_stream(self.agent, user_text)
             
@@ -287,30 +289,20 @@ class RealtimeVoiceSession:
                     break
                     
                 full_response += chunk
-                current_sentence += chunk
                 
                 # Send text chunk to frontend for typewriter effect
                 await self.ws.send_json({"type": "response_chunk", "text": chunk})
                 
-                # Check if we formed a full sentence/clause to send to TTS
-                # Use a while loop to extract all completed clauses, in case the LLM chunk contains multiple punctuations or spans across them.
-                while True:
-                    match = re.search(r'([.!?。！？,，、;:：；\n…]+)', current_sentence)
-                    if match:
-                        split_idx = match.end()
-                        sentence_to_synth = current_sentence[:split_idx].strip()
-                        current_sentence = current_sentence[split_idx:]
-                        
-                        if sentence_to_synth:
-                            await sentence_queue.put(sentence_to_synth)
-                    else:
-                        break
+                sentences = splitter.feed(chunk)
+                for sentence_to_synth in sentences:
+                    await sentence_queue.put(sentence_to_synth)
 
-            # Flush any remaining text in current_sentence
-            if current_sentence.strip():
-                await sentence_queue.put(current_sentence.strip())
+            # Flush any remaining text
+            sentences = splitter.flush()
+            for sentence_to_synth in sentences:
+                await sentence_queue.put(sentence_to_synth)
                 
-            # Signal TTS worker to finish
+            # Sentinel for TTS worker
             await sentence_queue.put(None)
             
             # Wait for all queued sentences to be synthesized and sent

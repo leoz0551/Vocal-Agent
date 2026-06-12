@@ -7,6 +7,7 @@ import logging
 import base64
 import torch
 import numpy as np
+import threading
 from typing import Optional, Callable, Any
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -34,10 +35,11 @@ def get_vad_model():
     return _vad_model, _vad_utils
 
 class RealtimeVoiceSession:
-    def __init__(self, ws: WebSocket, synthesize_fn: Callable, whisper_model: Any):
+    def __init__(self, ws: WebSocket, synthesize_fn: Callable, whisper_model: Any, gpu_lock: asyncio.Lock):
         self.ws = ws
         self.synthesize_fn = synthesize_fn
         self.whisper_model = whisper_model
+        self.gpu_lock = gpu_lock
         
         self.audio_queue = asyncio.Queue()
         self.is_connected = False
@@ -132,7 +134,7 @@ class RealtimeVoiceSession:
         
         silence_chunks = 0
         speech_chunks = 0
-        MAX_SILENCE_CHUNKS = int((16000 / vad_chunk_size) * 0.8) # 0.8s of silence triggers STT
+        MAX_SILENCE_CHUNKS = int((16000 / vad_chunk_size) * 1.7) # 1.7s of silence triggers STT
         MIN_SPEECH_CHUNKS = 4 # ~120ms of continuous speech to trigger interruption
         PRE_SPEECH_HISTORY = 15 # ~480ms history to avoid cutting off start of words
         
@@ -205,6 +207,8 @@ class RealtimeVoiceSession:
     async def handle_interruption(self):
         """Cancel ongoing LLM/TTS tasks and notify frontend to stop playback."""
         logger.info("🛑 Interruption triggered!")
+        if hasattr(self, 'cancel_event'):
+            self.cancel_event.set()
         if self.pipeline_task and not self.pipeline_task.done():
             self.pipeline_task.cancel()
             
@@ -214,17 +218,20 @@ class RealtimeVoiceSession:
         except Exception:
             pass
 
-    async def _tts_worker(self, sentence_queue: asyncio.Queue):
+    async def _tts_worker(self, sentence_queue: asyncio.Queue, cancel_event: threading.Event):
         """Background worker to synthesize text while LLM is still streaming."""
         try:
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None: # Sentinel to exit
                     break
+                if cancel_event.is_set():
+                    break
                 
                 # Synthesize
                 logger.debug(f"[V2] TTS worker synthesizing: {sentence}")
-                wav_bytes = await asyncio.to_thread(self.synthesize_fn, sentence, self.voice_id)
+                async with self.gpu_lock:
+                    wav_bytes = await asyncio.to_thread(self.synthesize_fn, sentence, self.voice_id, cancel_event)
                 
                 if wav_bytes and not asyncio.current_task().cancelled():
                     await self.ws.send_bytes(wav_bytes)
@@ -241,16 +248,22 @@ class RealtimeVoiceSession:
             
             # 1. STT (faster-whisper accepts float32 numpy arrays)
             def transcribe_sync():
-                kwargs = {"beam_size": 5}
+                kwargs = {"beam_size": 1, "vad_filter": True}
                 if self.language:
                     kwargs["language"] = self.language
                 segments, info = self.whisper_model.transcribe(audio_data, **kwargs)
                 return " ".join(seg.text for seg in segments).strip()
 
-            user_text = await asyncio.to_thread(transcribe_sync)
+            async with self.gpu_lock:
+                user_text = await asyncio.to_thread(transcribe_sync)
             
-            if not user_text or not user_text.strip():
-                logger.info("[V2] STT resulted in empty text.")
+            # Filter hallucinations and extremely short audio
+            cleaned_text = re.sub(r'[^\w\s]', '', user_text).strip()
+            filler_words = {"呃", "啊", "嗯", "哦", "嗯嗯", "呃呃"}
+            is_only_filler = all(char in filler_words for char in cleaned_text)
+            
+            if not user_text or not user_text.strip() or len(cleaned_text) < 2 or is_only_filler:
+                logger.info(f"[V2] STT resulted in empty or garbage text: '{user_text}', ignoring.")
                 await self.ws.send_json({"type": "audio_end"})
                 return
                 
@@ -259,11 +272,12 @@ class RealtimeVoiceSession:
             await self.ws.send_json({"type": "thinking", "message": "Thinking..."})
 
             # 2. LLM Streaming
+            self.cancel_event = threading.Event()
             full_response = ""
             current_sentence = ""
             
             sentence_queue = asyncio.Queue()
-            tts_task = asyncio.create_task(self._tts_worker(sentence_queue))
+            tts_task = asyncio.create_task(self._tts_worker(sentence_queue, self.cancel_event))
             
             llm_stream = knowledge_agent_client_stream(self.agent, user_text)
             

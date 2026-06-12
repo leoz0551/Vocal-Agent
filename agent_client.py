@@ -10,6 +10,10 @@ from agno.run.response import RunResponse
 
 load_dotenv()
 
+# Completely disable Agno telemetry to prevent 1-2s synchronous network delays
+os.environ["AGNO_TELEMETRY"] = "false"
+os.environ["PHIDATA_TELEMETRY"] = "false"
+
 # Define the Knowledge Agent
 knowledge_agent_ai = Agent(
     model=OpenAIChat(
@@ -35,6 +39,9 @@ knowledge_agent_ai = Agent(
     show_tool_calls=False,
     markdown=True,
     stream=False,
+    telemetry=False,
+    add_history_to_messages=True,
+    num_history_responses=10,
 )
 
 def create_streaming_agent(system_prompt: str) -> Agent:
@@ -51,6 +58,9 @@ def create_streaming_agent(system_prompt: str) -> Agent:
         show_tool_calls=False,
         markdown=True,
         stream=True, # Enable streaming for v2
+        telemetry=False,
+        add_history_to_messages=True,
+        num_history_responses=10,
     )
 
 def knowledge_agent_client_stream(agent: Agent, prompt: str):

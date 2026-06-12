@@ -22,6 +22,7 @@ import logging
 import tempfile
 from datetime import datetime
 from typing import Optional
+import threading
 
 import numpy as np
 import soundfile as sf
@@ -141,6 +142,7 @@ g2p_zh = None
 kokoro_model = None
 whisper_model = None
 models_loaded = False
+gpu_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
@@ -155,15 +157,25 @@ async def load_models():
     kokoro_model = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
     logger.info("✅ TTS models loaded.")
 
-    logger.info("Loading STT model (faster-whisper small) ...")
+    logger.info("Loading STT model (faster-whisper base) ...")
     from faster_whisper import WhisperModel
     import os
     whisper_model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "whisper")
-    whisper_model = WhisperModel("small", device="cpu", compute_type="int8", download_root=whisper_model_dir)
+    whisper_model = WhisperModel("base", device="cpu", compute_type="int8", download_root=whisper_model_dir)
     logger.info("✅ STT model loaded.")
 
     logger.info("Loading VAD model for V2...")
     get_vad_model()
+
+    logger.info("Warming up Jieba and Kokoro TTS...")
+    try:
+        import jieba
+        jieba.initialize()
+        g2p_zh("测试")
+        kokoro_model.create("t ɛ s t", "zf_xiaoxiao", is_phonemes=True)
+        logger.info("✅ Warmup completed.")
+    except Exception as e:
+        logger.warning(f"Warmup failed: {e}")
 
     models_loaded = True
     logger.info("🚀 All models ready — server is accepting requests.")
@@ -182,7 +194,7 @@ def _ensure_models():
 # Helper: synthesize text → WAV bytes
 # ---------------------------------------------------------------------------
 
-def _synthesize_wav(text: str, voice: Optional[str] = None) -> bytes:
+def _synthesize_wav(text: str, voice: Optional[str] = None, cancel_event: Optional[threading.Event] = None) -> bytes:
     """Convert a text string to WAV audio bytes via Kokoro TTS."""
     # Split text into sentences/clauses to prevent exceeding phoneme limits and reduce latency
     parts = re.split(r'([.!?。！？,，、;:：；\n…]+)', text.strip())
@@ -207,6 +219,10 @@ def _synthesize_wav(text: str, voice: Optional[str] = None) -> bytes:
         else:
             phonemes, _ = g2p_en(chunk)
             current_voice = voice if voice else "af_heart"
+            
+        if cancel_event and cancel_event.is_set():
+            logger.info("🛑 TTS synthesis aborted by cancellation event.")
+            break
             
         if not phonemes:
             logger.warning(f"  [{i}/{total_chunks}] ⚠️ No phonemes generated for chunk.")
@@ -247,7 +263,7 @@ def _transcribe_audio(audio_bytes: bytes) -> tuple[str, float]:
         tmp_path = tmp.name
 
     try:
-        segments, info = whisper_model.transcribe(tmp_path, beam_size=5)
+        segments, info = whisper_model.transcribe(tmp_path, beam_size=1, vad_filter=True)
         text = " ".join(seg.text for seg in segments).strip()
         duration = getattr(info, "duration", 0.0)
     finally:
@@ -295,7 +311,8 @@ async def speech_to_text(file: UploadFile = File(..., description="Audio file (W
     _ensure_models()
 
     audio_bytes = await file.read()
-    text, duration = await asyncio.to_thread(_transcribe_audio, audio_bytes)
+    async with gpu_lock:
+        text, duration = await asyncio.to_thread(_transcribe_audio, audio_bytes)
 
     if not text:
         raise HTTPException(status_code=400, detail="Could not transcribe any speech from the audio.")
@@ -336,7 +353,8 @@ async def text_to_speech(request: TTSRequest):
     _ensure_models()
 
     try:
-        wav_bytes = await asyncio.to_thread(_synthesize_wav, request.text, request.voice)
+        async with gpu_lock:
+            wav_bytes = await asyncio.to_thread(_synthesize_wav, request.text, request.voice)
         return StreamingResponse(io.BytesIO(wav_bytes), media_type="audio/wav")
     except Exception as e:
         logger.error(f"TTS synthesis failed: {e}")
@@ -355,7 +373,8 @@ async def conversation(file: UploadFile = File(..., description="Audio file (WAV
     _ensure_models()
 
     audio_bytes = await file.read()
-    user_text, _ = await asyncio.to_thread(_transcribe_audio, audio_bytes)
+    async with gpu_lock:
+        user_text, _ = await asyncio.to_thread(_transcribe_audio, audio_bytes)
 
     if not user_text:
         raise HTTPException(status_code=400, detail="Could not transcribe any speech.")
@@ -390,8 +409,9 @@ async def websocket_tts(ws: WebSocket):
     logger.info("🔌 WebSocket TTS client connected")
     
     current_task = None
+    current_cancel_event = None
     
-    async def process_text_task(text_to_process: str, voice_override: Optional[str]):
+    async def process_text_task(text_to_process: str, voice_override: Optional[str], cancel_evt: threading.Event):
         """Background task to synthesize and stream chunks."""
         parts = re.split(r'([.!?。！？,，、;:：；\n…]+)', text_to_process.strip())
         chunks = ["".join(parts[i:i+2]).strip() for i in range(0, len(parts), 2)]
@@ -403,14 +423,15 @@ async def websocket_tts(ws: WebSocket):
                     continue
                 
                 # Check for cancellation before expensive operations
-                if asyncio.current_task().cancelled():
+                if cancel_evt.is_set() or asyncio.current_task().cancelled():
                     break
                     
                 try:
-                    wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice_override)
+                    async with gpu_lock:
+                        wav_bytes = await asyncio.to_thread(_synthesize_wav, chunk, voice_override, cancel_evt)
                     
                     # Check again after yielding to thread
-                    if asyncio.current_task().cancelled():
+                    if cancel_evt.is_set() or asyncio.current_task().cancelled():
                         break
                         
                     if wav_bytes:
@@ -438,6 +459,8 @@ async def websocket_tts(ws: WebSocket):
             
             if action == "abort":
                 if current_task and not current_task.done():
+                    if current_cancel_event:
+                        current_cancel_event.set()
                     current_task.cancel()
                     logger.info("🛑 Received abort signal, cancelled ongoing TTS task.")
                 continue
@@ -447,10 +470,13 @@ async def websocket_tts(ws: WebSocket):
             
             if text:
                 if current_task and not current_task.done():
+                    if current_cancel_event:
+                        current_cancel_event.set()
                     current_task.cancel()
                     logger.info("⚠️ New text arrived, implicitly cancelled previous TTS task.")
                 
-                current_task = asyncio.create_task(process_text_task(text, voice))
+                current_cancel_event = threading.Event()
+                current_task = asyncio.create_task(process_text_task(text, voice, current_cancel_event))
                 
     except WebSocketDisconnect:
         logger.info("🔌 WebSocket TTS client disconnected")
@@ -494,7 +520,8 @@ async def websocket_voice(ws: WebSocket):
 
             # 2. STT
             try:
-                user_text, _ = await asyncio.to_thread(_transcribe_audio, audio_data)
+                async with gpu_lock:
+                    user_text, _ = await asyncio.to_thread(_transcribe_audio, audio_data)
             except Exception as e:
                 await ws.send_json({"type": "error", "message": f"STT failed: {e}"})
                 continue
@@ -525,7 +552,8 @@ async def websocket_voice(ws: WebSocket):
                 if not sentence:
                     continue
                 try:
-                    wav_bytes = await asyncio.to_thread(_synthesize_wav, sentence)
+                    async with gpu_lock:
+                        wav_bytes = await asyncio.to_thread(_synthesize_wav, sentence)
                     await ws.send_bytes(wav_bytes)
                 except Exception as e:
                     logger.error(f"TTS error for sentence: {e}")
@@ -550,7 +578,8 @@ async def websocket_v2_voice(ws: WebSocket):
     session = RealtimeVoiceSession(
         ws=ws,
         synthesize_fn=_synthesize_wav,
-        whisper_model=whisper_model
+        whisper_model=whisper_model,
+        gpu_lock=gpu_lock
     )
     await session.start()
 
